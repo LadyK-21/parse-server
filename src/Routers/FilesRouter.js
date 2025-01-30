@@ -3,10 +3,10 @@ import BodyParser from 'body-parser';
 import * as Middlewares from '../middlewares';
 import Parse from 'parse/node';
 import Config from '../Config';
-import mime from 'mime';
 import logger from '../logger';
 const triggers = require('../triggers');
 const http = require('http');
+const Utils = require('../Utils');
 
 const downloadFileFromURI = uri => {
   return new Promise((res, rej) => {
@@ -52,19 +52,21 @@ export class FilesRouter {
         limit: maxUploadSize,
       }), // Allow uploads without Content-Type, or with any Content-Type.
       Middlewares.handleParseHeaders,
+      Middlewares.handleParseSession,
       this.createHandler
     );
 
     router.delete(
       '/files/:filename',
       Middlewares.handleParseHeaders,
+      Middlewares.handleParseSession,
       Middlewares.enforceMasterKeyAccess,
       this.deleteHandler
     );
     return router;
   }
 
-  getHandler(req, res) {
+  async getHandler(req, res) {
     const config = Config.get(req.params.appId);
     if (!config) {
       res.status(403);
@@ -74,6 +76,7 @@ export class FilesRouter {
     }
     const filesController = config.filesController;
     const filename = req.params.filename;
+    const mime = (await import('mime')).default;
     const contentType = mime.getType(filename);
     if (isFileStreamable(req, filesController)) {
       filesController.handleFileStream(config, filename, req, res, contentType).catch(() => {
@@ -137,9 +140,49 @@ export class FilesRouter {
       return;
     }
 
+    const fileExtensions = config.fileUpload?.fileExtensions;
+    if (!isMaster && fileExtensions) {
+      const isValidExtension = extension => {
+        return fileExtensions.some(ext => {
+          if (ext === '*') {
+            return true;
+          }
+          const regex = new RegExp(ext);
+          if (regex.test(extension)) {
+            return true;
+          }
+        });
+      };
+      let extension = contentType;
+      if (filename && filename.includes('.')) {
+        extension = filename.substring(filename.lastIndexOf('.') + 1);
+      } else if (contentType && contentType.includes('/')) {
+        extension = contentType.split('/')[1];
+      }
+      extension = extension?.split(' ')?.join('');
+
+      if (extension && !isValidExtension(extension)) {
+        next(
+          new Parse.Error(
+            Parse.Error.FILE_SAVE_ERROR,
+            `File upload of extension ${extension} is disabled.`
+          )
+        );
+        return;
+      }
+    }
+
     const base64 = req.body.toString('base64');
     const file = new Parse.File(filename, { base64 }, contentType);
     const { metadata = {}, tags = {} } = req.fileData || {};
+    try {
+      // Scan request data for denied keywords
+      Utils.checkProhibitedKeywords(config, metadata);
+      Utils.checkProhibitedKeywords(config, tags);
+    } catch (error) {
+      next(new Parse.Error(Parse.Error.INVALID_KEY_NAME, error));
+      return;
+    }
     file.setTags(tags);
     file.setMetadata(metadata);
     const fileSize = Buffer.byteLength(req.body);
@@ -220,7 +263,7 @@ export class FilesRouter {
       const { filename } = req.params;
       // run beforeDeleteFile trigger
       const file = new Parse.File(filename);
-      file._url = filesController.adapter.getFileLocation(req.config, filename);
+      file._url = await filesController.adapter.getFileLocation(req.config, filename);
       const fileObject = { file, fileSize: null };
       await triggers.maybeRunFileTrigger(
         triggers.Types.beforeDelete,
@@ -266,5 +309,10 @@ export class FilesRouter {
 }
 
 function isFileStreamable(req, filesController) {
-  return req.get('Range') && typeof filesController.adapter.handleFileStream === 'function';
+  const range = (req.get('Range') || '/-/').split('-');
+  const start = Number(range[0]);
+  const end = Number(range[1]);
+  return (
+    (!isNaN(start) || !isNaN(end)) && typeof filesController.adapter.handleFileStream === 'function'
+  );
 }
