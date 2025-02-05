@@ -91,6 +91,22 @@ const toPostgresValue = value => {
   return value;
 };
 
+const toPostgresValueCastType = value => {
+  const postgresValue = toPostgresValue(value);
+  let castType;
+  switch (typeof postgresValue) {
+    case 'number':
+      castType = 'double precision';
+      break;
+    case 'boolean':
+      castType = 'boolean';
+      break;
+    default:
+      castType = undefined;
+  }
+  return castType;
+};
+
 const transformValue = value => {
   if (typeof value === 'object' && value.__type === 'Pointer') {
     return value.objectId;
@@ -159,6 +175,8 @@ const toPostgresSchema = schema => {
   return schema;
 };
 
+const isArrayIndex = (arrayIndex) => Array.from(arrayIndex).every(c => c >= '0' && c <= '9');
+
 const handleDotFields = object => {
   Object.keys(object).forEach(fieldName => {
     if (fieldName.indexOf('.') > -1) {
@@ -171,9 +189,7 @@ const handleDotFields = object => {
       if (value && value.__op === 'Delete') {
         value = undefined;
       }
-      /* eslint-disable no-cond-assign */
       while ((next = components.shift())) {
-        /* eslint-enable no-cond-assign */
         currentObj[next] = currentObj[next] || {};
         if (components.length === 0) {
           currentObj[next] = value;
@@ -191,7 +207,11 @@ const transformDotFieldToComponents = fieldName => {
     if (index === 0) {
       return `"${cmpt}"`;
     }
-    return `'${cmpt}'`;
+    if (isArrayIndex(cmpt)) {
+      return Number(cmpt);
+    } else {
+      return `'${cmpt}'`;
+    }
   });
 };
 
@@ -215,7 +235,7 @@ const transformAggregateField = fieldName => {
   if (fieldName === '$_updated_at') {
     return 'updatedAt';
   }
-  return fieldName.substr(1);
+  return fieldName.substring(1);
 };
 
 const validateKeys = object => {
@@ -273,7 +293,6 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         continue;
       }
     }
-
     const authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
     if (authDataMatch) {
       // TODO: Handle querying by _auth_data_provider, authData is stored in authData field
@@ -369,9 +388,12 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
             );
           } else {
             if (fieldName.indexOf('.') >= 0) {
-              const constraintFieldName = transformDotField(fieldName);
+              const castType = toPostgresValueCastType(fieldValue.$ne);
+              const constraintFieldName = castType
+                ? `CAST ((${transformDotField(fieldName)}) AS ${castType})`
+                : transformDotField(fieldName);
               patterns.push(
-                `(${constraintFieldName} <> $${index} OR ${constraintFieldName} IS NULL)`
+                `(${constraintFieldName} <> $${index + 1} OR ${constraintFieldName} IS NULL)`
               );
             } else if (typeof fieldValue.$ne === 'object' && fieldValue.$ne.$relativeTime) {
               throw new Parse.Error(
@@ -401,8 +423,12 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
         index += 1;
       } else {
         if (fieldName.indexOf('.') >= 0) {
+          const castType = toPostgresValueCastType(fieldValue.$eq);
+          const constraintFieldName = castType
+            ? `CAST ((${transformDotField(fieldName)}) AS ${castType})`
+            : transformDotField(fieldName);
           values.push(fieldValue.$eq);
-          patterns.push(`${transformDotField(fieldName)} = $${index++}`);
+          patterns.push(`${constraintFieldName} = $${index++}`);
         } else if (typeof fieldValue.$eq === 'object' && fieldValue.$eq.$relativeTime) {
           throw new Parse.Error(
             Parse.Error.INVALID_JSON,
@@ -771,20 +797,11 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
     Object.keys(ParseToPosgresComparator).forEach(cmp => {
       if (fieldValue[cmp] || fieldValue[cmp] === 0) {
         const pgComparator = ParseToPosgresComparator[cmp];
-        let postgresValue = toPostgresValue(fieldValue[cmp]);
         let constraintFieldName;
+        let postgresValue = toPostgresValue(fieldValue[cmp]);
+
         if (fieldName.indexOf('.') >= 0) {
-          let castType;
-          switch (typeof postgresValue) {
-            case 'number':
-              castType = 'double precision';
-              break;
-            case 'boolean':
-              castType = 'boolean';
-              break;
-            default:
-              castType = undefined;
-          }
+          const castType = toPostgresValueCastType(fieldValue[cmp]);
           constraintFieldName = castType
             ? `CAST ((${transformDotField(fieldName)}) AS ${castType})`
             : transformDotField(fieldName);
@@ -800,6 +817,7 @@ const buildWhereClause = ({ schema, query, index, caseInsensitive }): WhereClaus
             if (parserResult.status === 'success') {
               postgresValue = toPostgresValue(parserResult.result);
             } else {
+              // eslint-disable-next-line no-console
               console.error('Error while parsing relative date', parserResult);
               throw new Parse.Error(
                 Parse.Error.INVALID_JSON,
@@ -837,13 +855,18 @@ export class PostgresStorageAdapter implements StorageAdapter {
   _pgp: any;
   _stream: any;
   _uuid: any;
+  schemaCacheTtl: ?number;
 
   constructor({ uri, collectionPrefix = '', databaseOptions = {} }: any) {
+    const options = { ...databaseOptions };
     this._collectionPrefix = collectionPrefix;
     this.enableSchemaHooks = !!databaseOptions.enableSchemaHooks;
-    delete databaseOptions.enableSchemaHooks;
+    this.schemaCacheTtl = databaseOptions.schemaCacheTtl;
+    for (const key of ['enableSchemaHooks', 'schemaCacheTtl']) {
+      delete options[key];
+    }
 
-    const { client, pgp } = createClient(uri, databaseOptions);
+    const { client, pgp } = createClient(uri, options);
     this._client = client;
     this._onchange = () => {};
     this._pgp = pgp;
@@ -893,6 +916,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       this._stream
         .none('NOTIFY $1~, $2', ['schema.change', { senderId: this._uuid }])
         .catch(error => {
+          // eslint-disable-next-line no-console
           console.log('Failed to Notify:', error); // unlikely to ever happen
         });
     }
@@ -1176,7 +1200,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const now = new Date().getTime();
     const helpers = this._pgp.helpers;
     debug('deleteAllClasses');
-
+    if (this._client?.$pool.ended) {
+      return;
+    }
     await this._client
       .task('delete-all-classes', async t => {
         try {
@@ -1308,12 +1334,17 @@ export class PostgresStorageAdapter implements StorageAdapter {
         return;
       }
       var authDataMatch = fieldName.match(/^_auth_data_([a-zA-Z0-9_]+)$/);
+      const authDataAlreadyExists = !!object.authData;
       if (authDataMatch) {
         var provider = authDataMatch[1];
         object['authData'] = object['authData'] || {};
         object['authData'][provider] = object[fieldName];
         delete object[fieldName];
         fieldName = 'authData';
+        // Avoid adding authData multiple times to the query
+        if (authDataAlreadyExists) {
+          return;
+        }
       }
 
       columnsArray.push(fieldName);
@@ -1793,7 +1824,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
       caseInsensitive,
     });
     values.push(...where.values);
-
     const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
     const limitPattern = hasLimit ? `LIMIT $${values.length + 1}` : '';
     if (hasLimit) {
@@ -1897,14 +1927,14 @@ export class PostgresStorageAdapter implements StorageAdapter {
         };
       }
       if (object[fieldName] && schema.fields[fieldName].type === 'Polygon') {
-        let coords = object[fieldName];
-        coords = coords.substr(2, coords.length - 4).split('),(');
-        coords = coords.map(point => {
+        let coords = new String(object[fieldName]);
+        coords = coords.substring(2, coords.length - 2).split('),(');
+        const updatedCoords = coords.map(point => {
           return [parseFloat(point.split(',')[1]), parseFloat(point.split(',')[0])];
         });
         object[fieldName] = {
           __type: 'Polygon',
-          coordinates: coords,
+          coordinates: updatedCoords,
         };
       }
       if (object[fieldName] && schema.fields[fieldName].type === 'File') {
@@ -2224,8 +2254,11 @@ export class PostgresStorageAdapter implements StorageAdapter {
           });
           stage.$match = collapse;
         }
-        for (const field in stage.$match) {
+        for (let field in stage.$match) {
           const value = stage.$match[field];
+          if (field === '_id') {
+            field = 'objectId';
+          }
           const matchPatterns = [];
           Object.keys(ParseToPosgresComparator).forEach(cmp => {
             if (value[cmp]) {
@@ -2343,7 +2376,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
         debug(`initializationDone in ${ctx.duration}`);
       })
       .catch(error => {
-        /* eslint-disable no-console */
+        // eslint-disable-next-line no-console
         console.error(error);
       });
   }
@@ -2587,16 +2620,16 @@ function isAnyValueRegexStartsWith(values) {
   });
 }
 
-function createLiteralRegex(remaining) {
+function createLiteralRegex(remaining: string) {
   return remaining
     .split('')
     .map(c => {
-      const regex = RegExp('[0-9 ]|\\p{L}', 'u'); // Support all unicode letter chars
+      const regex = RegExp('[0-9 ]|\\p{L}', 'u'); // Support all Unicode letter chars
       if (c.match(regex) !== null) {
-        // don't escape alphanumeric characters
+        // Don't escape alphanumeric characters
         return c;
       }
-      // escape everything else (single quotes with single quotes, everything else with a backslash)
+      // Escape everything else (single quotes with single quotes, everything else with a backslash)
       return c === `'` ? `''` : `\\${c}`;
     })
     .join('');
@@ -2606,31 +2639,35 @@ function literalizeRegexPart(s: string) {
   const matcher1 = /\\Q((?!\\E).*)\\E$/;
   const result1: any = s.match(matcher1);
   if (result1 && result1.length > 1 && result1.index > -1) {
-    // process regex that has a beginning and an end specified for the literal text
-    const prefix = s.substr(0, result1.index);
+    // Process Regex that has a beginning and an end specified for the literal text
+    const prefix = s.substring(0, result1.index);
     const remaining = result1[1];
 
     return literalizeRegexPart(prefix) + createLiteralRegex(remaining);
   }
 
-  // process regex that has a beginning specified for the literal text
+  // Process Regex that has a beginning specified for the literal text
   const matcher2 = /\\Q((?!\\E).*)$/;
   const result2: any = s.match(matcher2);
   if (result2 && result2.length > 1 && result2.index > -1) {
-    const prefix = s.substr(0, result2.index);
+    const prefix = s.substring(0, result2.index);
     const remaining = result2[1];
 
     return literalizeRegexPart(prefix) + createLiteralRegex(remaining);
   }
 
-  // remove all instances of \Q and \E from the remaining text & escape single quotes
+  // Remove problematic chars from remaining text
   return s
+    // Remove all instances of \Q and \E
     .replace(/([^\\])(\\E)/, '$1')
     .replace(/([^\\])(\\Q)/, '$1')
     .replace(/^\\E/, '')
     .replace(/^\\Q/, '')
-    .replace(/([^'])'/, `$1''`)
-    .replace(/^'([^'])/, `''$1`);
+    // Ensure even number of single quote sequences by adding an extra single quote if needed;
+    // this ensures that every single quote is escaped
+    .replace(/'+/g, match => {
+      return match.length % 2 === 0 ? match : match + "'";
+    });
 }
 
 var GeoPointCoder = {
