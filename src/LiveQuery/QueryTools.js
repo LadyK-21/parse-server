@@ -103,8 +103,18 @@ function contains(haystack: Array, needle: any): boolean {
         return true;
       }
     }
+
     return false;
   }
+
+  if (Array.isArray(needle)) {
+    for (const need of needle) {
+      if (contains(haystack, need)) {
+        return true;
+      }
+    }
+  }
+
   return haystack.indexOf(needle) > -1;
 }
 /**
@@ -213,7 +223,7 @@ function matchesKeyConstraints(object, key, constraints) {
   // More complex cases
   for (var condition in constraints) {
     compareTo = constraints[condition];
-    if (compareTo.__type) {
+    if (compareTo?.__type) {
       compareTo = Parse._decode(key, compareTo);
     }
     switch (condition) {
@@ -234,6 +244,11 @@ function matchesKeyConstraints(object, key, constraints) {
         break;
       case '$gte':
         if (object[key] < compareTo) {
+          return false;
+        }
+        break;
+      case '$eq':
+        if (!equalObjects(object[key], compareTo)) {
           return false;
         }
         break;
@@ -334,9 +349,25 @@ function matchesKeyConstraints(object, key, constraints) {
         return true;
       }
       case '$geoWithin': {
-        const points = compareTo.$polygon.map(geoPoint => [geoPoint.latitude, geoPoint.longitude]);
-        const polygon = new Parse.Polygon(points);
-        return polygon.containsPoint(object[key]);
+        if (compareTo.$polygon) {
+          const points = compareTo.$polygon.map(geoPoint => [
+            geoPoint.latitude,
+            geoPoint.longitude,
+          ]);
+          const polygon = new Parse.Polygon(points);
+          return polygon.containsPoint(object[key]);
+        }
+        if (compareTo.$centerSphere) {
+          const [WGS84Point, maxDistance] = compareTo.$centerSphere;
+          const centerPoint = new Parse.GeoPoint({
+            latitude: WGS84Point[1],
+            longitude: WGS84Point[0],
+          });
+          const point = new Parse.GeoPoint(object[key]);
+          const distance = point.radiansTo(centerPoint);
+          return distance <= maxDistance;
+        }
+        break;
       }
       case '$geoIntersects': {
         const polygon = new Parse.Polygon(object[key].coordinates);

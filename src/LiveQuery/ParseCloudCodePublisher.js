@@ -11,6 +11,15 @@ class ParseCloudCodePublisher {
     this.parsePublisher = ParsePubSub.createPublisher(config);
   }
 
+  async connect() {
+    if (typeof this.parsePublisher.connect === 'function') {
+      if (this.parsePublisher.isOpen) {
+        return;
+      }
+      return Promise.resolve(this.parsePublisher.connect());
+    }
+  }
+
   onCloudCodeAfterSave(request: any): void {
     this._onCloudCodeMessage(Parse.applicationId + 'afterSave', request);
   }
@@ -39,6 +48,9 @@ class ParseCloudCodePublisher {
     };
     if (request.original) {
       message.originalParseObject = request.original._toFullJSON();
+    }
+    if (request.classLevelPermissions) {
+      message.classLevelPermissions = request.classLevelPermissions;
     }
     this.parsePublisher.publish(type, JSON.stringify(message));
   }

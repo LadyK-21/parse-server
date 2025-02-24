@@ -20,7 +20,7 @@ export class ClassesRouter extends PromiseRouter {
 
   handleFind(req) {
     const body = Object.assign(req.body, ClassesRouter.JSONFromQuery(req.query));
-    const options = ClassesRouter.optionsFromBody(body);
+    const options = ClassesRouter.optionsFromBody(body, req.config.defaultLimit);
     if (req.config.maxLimit && body.limit > req.config.maxLimit) {
       // Silently replace the limit on the query with the max configured
       options.limit = Number(req.config.maxLimit);
@@ -106,6 +106,13 @@ export class ClassesRouter extends PromiseRouter {
   }
 
   handleCreate(req) {
+    if (
+      this.className(req) === '_User' &&
+      typeof req.body?.objectId === 'string' &&
+      req.body.objectId.startsWith('role:')
+    ) {
+      throw new Parse.Error(Parse.Error.OPERATION_FORBIDDEN, 'Invalid object ID.');
+    }
     return rest.create(
       req.config,
       req.auth,
@@ -149,7 +156,7 @@ export class ClassesRouter extends PromiseRouter {
     return json;
   }
 
-  static optionsFromBody(body) {
+  static optionsFromBody(body, defaultLimit) {
     const allowConstraints = [
       'skip',
       'limit',
@@ -166,6 +173,7 @@ export class ClassesRouter extends PromiseRouter {
       'subqueryReadPreference',
       'hint',
       'explain',
+      'comment',
     ];
 
     for (const key of Object.keys(body)) {
@@ -180,7 +188,7 @@ export class ClassesRouter extends PromiseRouter {
     if (body.limit || body.limit === 0) {
       options.limit = Number(body.limit);
     } else {
-      options.limit = Number(100);
+      options.limit = Number(defaultLimit);
     }
     if (body.order) {
       options.order = String(body.order);
@@ -214,6 +222,9 @@ export class ClassesRouter extends PromiseRouter {
     }
     if (body.explain) {
       options.explain = body.explain;
+    }
+    if (body.comment && typeof body.comment === 'string') {
+      options.comment = body.comment;
     }
     return options;
   }
